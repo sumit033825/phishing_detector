@@ -1,0 +1,844 @@
+"""
+single_file_app.py - Standalone Link Safety Checker
+Complete Single-File Delivery: Feature Extractor, Synthetic Dataset Generator,
+Random Forest Pipeline, and Human-Centered Plain-English UI.
+Run directly with: streamlit run single_file_app.py
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import difflib
+import ipaddress
+import urllib.parse
+from typing import Any, Dict, List, Tuple
+
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+# ==============================================================================
+# SECTION 1: HEURISTIC CONFIGURATION & FEATURE EXTRACTOR
+# ==============================================================================
+
+KNOWN_SHORTENERS = {
+    "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd",
+    "buff.ly", "adf.ly", "bit.do", "mcaf.ee", "rebrand.ly", "lnkd.in",
+    "tiny.cc", "soo.gd", "s2r.co", "clickmeter.com", "cutt.ly"
+}
+
+PHISHING_KEYWORDS = [
+    "login", "verify", "update", "banking", "secure",
+    "signin", "account", "security", "confirm", "password",
+    "credential", "wallet", "authenticate", "validation", "support",
+    "recover", "billing", "access", "lock", "suspend"
+]
+
+FEATURE_NAMES: List[str] = [
+    "url_length",
+    "hostname_length",
+    "path_length",
+    "count_dots",
+    "count_hyphens",
+    "count_at",
+    "count_question",
+    "count_equal",
+    "count_slash",
+    "has_ip_address",
+    "is_https",
+    "is_shortened",
+    "keyword_count",
+    "subdomain_depth",
+    "has_double_slash_path",
+    "count_digits",
+]
+
+
+class URLLexicalExtractor:
+    """Automated lexical feature extractor for URL threat analysis."""
+
+    def __init__(self, shorteners: set = None, keywords: list = None):
+        self.shorteners = shorteners or KNOWN_SHORTENERS
+        self.keywords = keywords or PHISHING_KEYWORDS
+
+    def _normalize_and_parse(self, raw_url: str) -> Tuple[str, urllib.parse.ParseResult, bool]:
+        raw_url = raw_url.strip()
+        raw_url = re.sub(r"^hxxps?://", lambda m: "https://" if "s" in m.group(0).lower() else "http://", raw_url, flags=re.IGNORECASE)
+        raw_url = re.sub(r"^h\*\*ps?://", lambda m: "https://" if "s" in m.group(0).lower() else "http://", raw_url, flags=re.IGNORECASE)
+        raw_url = re.sub(r"\[\.\]|\(\.\)|\{\.\}", ".", raw_url)
+        raw_url = re.sub(r"\[dot\]|\(dot\)|\{dot\}", ".", raw_url, flags=re.IGNORECASE)
+        raw_url = re.sub(r"\[([^:\]]*)\]", r"\1", raw_url)
+
+        had_scheme = bool(re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw_url))
+        url_to_parse = raw_url if had_scheme else f"http://{raw_url}"
+        try:
+            parsed = urllib.parse.urlparse(url_to_parse)
+        except ValueError:
+            safe_url = url_to_parse.replace("[", "").replace("]", "")
+            try:
+                parsed = urllib.parse.urlparse(safe_url)
+            except Exception:
+                parsed = urllib.parse.urlparse("http://unknown-host/")
+        return raw_url, parsed, had_scheme
+
+    def _check_ip_address(self, hostname: str) -> int:
+        clean_host = hostname.split(":")[0].strip("[]")
+        try:
+            ipaddress.ip_address(clean_host)
+            return 1
+        except ValueError:
+            ip_pattern = r"^(\d{1,3}\.){3}\d{1,3}$"
+            return 1 if re.match(ip_pattern, clean_host) else 0
+
+    def _calculate_subdomain_depth(self, hostname: str) -> int:
+        clean_host = hostname.split(":")[0]
+        if self._check_ip_address(clean_host):
+            return 0
+        parts = [p for p in clean_host.split(".") if p]
+        if len(parts) <= 2:
+            return 0
+        common_compound_tlds = {"co.uk", "com.au", "gov.uk", "ac.uk", "org.uk", "co.jp", "com.br"}
+        if len(parts) >= 3 and f"{parts[-2]}.{parts[-1]}".lower() in common_compound_tlds:
+            return max(0, len(parts) - 3)
+        return max(0, len(parts) - 2)
+
+    def extract(self, url: str) -> Dict[str, Any]:
+        normalized_url, parsed, had_scheme = self._normalize_and_parse(url)
+        hostname = (parsed.netloc or "").lower()
+        path = parsed.path or ""
+        full_text = normalized_url.lower()
+
+        detected_keywords = sum(1 for kw in self.keywords if kw in full_text)
+        clean_host_for_shortener = hostname.split(":")[0]
+        is_short = 1 if clean_host_for_shortener in self.shorteners else 0
+        is_https_flag = 1 if (had_scheme and parsed.scheme.lower() == "https") else 0
+
+        return {
+            "url_length": len(normalized_url),
+            "hostname_length": len(hostname),
+            "path_length": len(path),
+            "count_dots": normalized_url.count("."),
+            "count_hyphens": normalized_url.count("-"),
+            "count_at": normalized_url.count("@"),
+            "count_question": normalized_url.count("?"),
+            "count_equal": normalized_url.count("="),
+            "count_slash": normalized_url.count("/"),
+            "has_ip_address": self._check_ip_address(hostname),
+            "is_https": is_https_flag,
+            "is_shortened": is_short,
+            "keyword_count": detected_keywords,
+            "subdomain_depth": self._calculate_subdomain_depth(hostname),
+            "has_double_slash_path": 1 if "//" in path else 0,
+            "count_digits": sum(c.isdigit() for c in normalized_url),
+        }
+
+    def get_heuristic_flags(self, url: str, features: Dict[str, Any] = None) -> List[str]:
+        if features is None:
+            features = self.extract(url)
+
+        normalized_url, parsed, had_scheme = self._normalize_and_parse(url)
+        hostname = (parsed.netloc or "").lower()
+        full_text = normalized_url.lower()
+        flags: List[str] = []
+
+        if features["has_ip_address"]:
+            flags.append(f"Uses raw IP address instead of domain name: `{hostname}`")
+        if not features["is_https"]:
+            if had_scheme and parsed.scheme.lower() == "http":
+                flags.append("Lacks HTTPS encryption (Cleartext HTTP connection)")
+            else:
+                flags.append("No secure HTTPS protocol specified")
+        if features["is_shortened"]:
+            flags.append(f"Known URL shortener detected (`{hostname}`), concealing true destination")
+        found_kws = [kw for kw in self.keywords if kw in full_text]
+        if found_kws:
+            flags.append(f"Contains sensitive phishing keyword(s): {', '.join(f'`{kw}`' for kw in found_kws)}")
+        if features["subdomain_depth"] >= 2:
+            flags.append(f"Excessive subdomain depth ({features['subdomain_depth']} subdomains)")
+        if features["count_at"] > 0:
+            flags.append("Contains '@' symbol (Browser credential injection / redirect exploit)")
+        if features["has_double_slash_path"]:
+            flags.append("Contains double slash (`//`) in URL path (Redirection evasion tactic)")
+        if features["url_length"] > 75:
+            flags.append(f"Abnormal URL length ({features['url_length']} characters)")
+        if features["count_hyphens"] >= 3:
+            flags.append(f"High hyphen count ({features['count_hyphens']}), characteristic of typosquatting")
+        if features["count_equal"] >= 3 or features["count_question"] >= 2:
+            flags.append("High query parameter density used to inject tracking tokens")
+
+        return flags
+
+
+# ==============================================================================
+# SECTION 2: SYNTHETIC SEED DATASET & MODEL PIPELINE
+# ==============================================================================
+
+def generate_synthetic_dataset() -> Tuple[List[str], List[int]]:
+    urls: List[str] = []
+    labels: List[int] = []
+
+    safe_bases = [
+        "https://www.google.com", "https://en.wikipedia.org/wiki/Cybersecurity",
+        "https://github.com/scikit-learn/scikit-learn", "https://stackoverflow.com/questions/12345",
+        "https://docs.python.org/3/library/urllib.parse.html", "https://www.nytimes.com/section/technology",
+        "https://www.amazon.com/dp/B08N5WRWNW", "https://news.ycombinator.com/item?id=38192014",
+        "https://developer.mozilla.org/en-US/docs/Web/Security", "https://www.apple.com/iphone-16-pro/",
+        "https://arxiv.org/abs/2301.00001", "https://medium.com/@engineering/clean-code",
+        "https://pypi.org/project/streamlit/", "https://www.cloudflare.com/learning/security/what-is-phishing/",
+    ]
+    for b in safe_bases:
+        urls.append(b)
+        labels.append(0)
+
+    safe_domains = ["https://www.google.com", "https://github.com", "https://stackoverflow.com", "https://docs.python.org", "https://en.wikipedia.org"]
+    safe_subpaths = ["/about", "/contact-us", "/pricing", "/features", "/documentation/v2", "/search?category=books", "/terms-of-service", "/faq/general"]
+    for dom in safe_domains:
+        for sub in safe_subpaths:
+            urls.append(f"{dom}{sub}")
+            labels.append(0)
+
+    phish_bases = [
+        "http://192.168.1.1/secure-login/bank/verify.php",
+        "http://192.168.0.101/signin-account-verification/",
+        "http://45.33.32.156/secure/bank/verify.php?token=92834",
+        "http://218.45.12.9/update-account-credentials/webscr.php",
+        "http://paypal-security-update.com.verify-auth.xyz/signin?account=locked",
+        "http://apple-id-verify.account-unlock.xyz/security-check",
+        "http://secure-login.bankofamerica.com.evil-redirect.net/update",
+        "http://login.microsoftonline.com-security.support/auth",
+        "http://chase-bank-verify-identity.info/login.aspx",
+        "http://wellsfargo-account-reactivate.biz/secure/login",
+        "http://bit.ly/secure-login-bank-verify",
+        "http://tinyurl.com/account-suspended-update",
+        "http://google.com@evil-site.com/login-verification",
+        "http://legit-portal.com//phishing-payload/login.php",
+        "http://secure.account.update.verify.paypal.com.fraud-network.net/login",
+    ]
+    for b in phish_bases:
+        urls.append(b)
+        labels.append(1)
+
+    phish_domains = ["http://verify-bank-security-center.com", "http://account-update-alert.xyz", "http://secure-online-signin-portal.net", "http://billing-issue-action-required.org"]
+    phish_paths = ["/login.php?session=expired", "/verify/identity/account/update", "/signin/password-reset?token=xyz", "/banking/customer/security-check.aspx", "/webscr?cmd=_login_verification"]
+    for dom in phish_domains:
+        for pth in phish_paths:
+            urls.append(f"{dom}{pth}")
+            labels.append(1)
+
+    for ip in ["192.168.1.50", "45.76.12.89", "185.193.65.22"]:
+        for pth in phish_paths[:3]:
+            urls.append(f"http://{ip}{pth}")
+            labels.append(1)
+
+    return urls, labels
+
+
+def train_phishing_model(model_path: str = None) -> Tuple[RandomForestClassifier, Dict[str, float]]:
+    urls, labels = generate_synthetic_dataset()
+    extractor = URLLexicalExtractor()
+    feature_records = [extractor.extract(u) for u in urls]
+    df = pd.DataFrame(feature_records)[FEATURE_NAMES]
+    y = np.array(labels)
+
+    X_train, X_test, y_train, y_test = train_test_split(df, y, test_size=0.25, random_state=42, stratify=y)
+    model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
+    model.fit(X_train, y_train)
+
+    preds = model.predict(X_test)
+    metrics = {"accuracy": float(accuracy_score(y_test, preds)), "samples": len(df)}
+
+    if model_path:
+        os.makedirs(os.path.dirname(os.path.abspath(model_path)), exist_ok=True)
+        joblib.dump(model, model_path)
+
+    return model, metrics
+
+
+def load_or_train_model(model_path: str = "model.pkl") -> Tuple[RandomForestClassifier, Dict[str, float]]:
+    if os.path.exists(model_path):
+        try:
+            return joblib.load(model_path), {"status": "loaded_from_disk"}
+        except Exception:
+            pass
+    return train_phishing_model(model_path=model_path)
+
+
+POPULAR_TARGET_BRANDS: List[str] = [
+    "google.com",
+    "paypal.com",
+    "microsoft.com",
+    "apple.com",
+    "amazon.com",
+    "netflix.com",
+    "facebook.com",
+    "instagram.com",
+]
+
+
+def extract_domain_base(host: str) -> str:
+    clean = host.split(":")[0].strip().lower()
+    if clean.startswith("www."):
+        clean = clean[4:]
+    return clean
+
+
+def check_brand_typosquatting(
+    host: str,
+    target_brands: List[str] = POPULAR_TARGET_BRANDS
+) -> Tuple[bool, str, float]:
+    clean_host = extract_domain_base(host)
+    if not clean_host:
+        return False, "", 0.0
+
+    for brand in target_brands:
+        if clean_host == brand or clean_host.endswith(f".{brand}"):
+            return False, "", 0.0
+
+    host_parts = [p for p in clean_host.split(".") if p]
+    if len(host_parts) >= 2:
+        domain_name = host_parts[-2]
+    elif host_parts:
+        domain_name = host_parts[0]
+    else:
+        return False, "", 0.0
+
+    best_brand = ""
+    highest_ratio = 0.0
+
+    for brand in target_brands:
+        brand_name = brand.split(".")[0]
+        full_ratio = difflib.SequenceMatcher(None, clean_host, brand).ratio()
+        base_ratio = difflib.SequenceMatcher(None, domain_name, brand_name).ratio()
+        max_ratio = max(full_ratio, base_ratio)
+
+        if max_ratio > highest_ratio and max_ratio > 0.82:
+            highest_ratio = max_ratio
+            best_brand = brand
+
+    if highest_ratio > 0.82 and best_brand:
+        return True, best_brand, round(highest_ratio, 2)
+
+    return False, "", 0.0
+
+
+def predict_url(url: str, model: RandomForestClassifier, extractor: URLLexicalExtractor = None) -> Dict[str, Any]:
+    extractor = extractor or URLLexicalExtractor()
+    features = extractor.extract(url)
+    heuristic_flags = extractor.get_heuristic_flags(url, features)
+    df_features = pd.DataFrame([features])[FEATURE_NAMES]
+
+    prediction_class = int(model.predict(df_features)[0])
+    probabilities = model.predict_proba(df_features)[0]
+    phishing_prob = float(probabilities[1]) if len(probabilities) > 1 else float(prediction_class)
+    risk_score_pct = round(phishing_prob * 100.0, 1)
+
+    normalized_url, parsed, _ = extractor._normalize_and_parse(url)
+    hostname = (parsed.netloc or "").lower()
+    is_typosquat, spoofed_brand, sim_score = check_brand_typosquatting(hostname)
+    if is_typosquat:
+        heuristic_flags.insert(0, f"⚠️ Possible Typosquatting / Brand Impersonation of {spoofed_brand}")
+        risk_score_pct = max(risk_score_pct, 78.5)
+        status_label = "Phishing"
+        status_color = "danger"
+    elif risk_score_pct >= 60.0 or prediction_class == 1:
+        status_label, status_color = "Phishing", "danger"
+    elif risk_score_pct >= 35.0 or len(heuristic_flags) >= 2:
+        status_label, status_color = "Suspicious", "warning"
+    else:
+        status_label, status_color = "Legitimate", "success"
+
+    return {
+        "url": url,
+        "status": status_label,
+        "status_color": status_color,
+        "is_phishing": bool(prediction_class == 1 or risk_score_pct >= 50.0),
+        "risk_score": risk_score_pct,
+        "heuristic_flags": heuristic_flags,
+        "features": features,
+    }
+
+
+def clean_input_link(raw_url: str) -> str:
+    cleaned = raw_url.strip()
+    if not cleaned:
+        return ""
+
+    # 1. Normalize common defanged schemes (hxxp -> http, hxxps -> https)
+    cleaned = re.sub(r"^hxxps?://", lambda m: "https://" if "s" in m.group(0).lower() else "http://", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^h\*\*ps?://", lambda m: "https://" if "s" in m.group(0).lower() else "http://", cleaned, flags=re.IGNORECASE)
+
+    # 2. Refang defanged brackets: [.], (.), {.} -> .
+    cleaned = re.sub(r"\[\.\]|\(\.\)|\{\.\}", ".", cleaned)
+
+    # 3. Refang [dot], (dot), {dot} -> .
+    cleaned = re.sub(r"\[dot\]|\(dot\)|\{dot\}", ".", cleaned, flags=re.IGNORECASE)
+
+    # 4. Remove rogue non-IPv6 brackets (prevents "ValueError: Invalid IPv6 URL")
+    cleaned = re.sub(r"\[([^:\]]*)\]", r"\1", cleaned)
+
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", cleaned):
+        cleaned = f"http://{cleaned}"
+    return cleaned
+
+
+def parse_link_parts(normalized_url: str) -> Dict[str, str]:
+    try:
+        parsed = urllib.parse.urlsplit(normalized_url)
+        scheme = (parsed.scheme or "http").lower()
+        host = parsed.netloc or "Unknown Website"
+        path = parsed.path if parsed.path else "/"
+        if parsed.query:
+            path += f"?{parsed.query}"
+    except ValueError:
+        safe_url = normalized_url.replace("[", "").replace("]", "")
+        try:
+            parsed = urllib.parse.urlsplit(safe_url)
+            scheme = (parsed.scheme or "http").lower()
+            host = parsed.netloc or "Unknown Website"
+            path = parsed.path if parsed.path else "/"
+            if parsed.query:
+                path += f"?{parsed.query}"
+        except Exception:
+            match = re.match(r"^([a-zA-Z]+)://([^/?#]+)(.*)$", safe_url)
+            if match:
+                scheme = match.group(1).lower()
+                host = match.group(2)
+                path = match.group(3) or "/"
+            else:
+                scheme = "http"
+                host = safe_url
+                path = "/"
+
+    return {
+        "scheme": scheme,
+        "is_https": scheme == "https",
+        "host": host,
+        "path": path,
+    }
+
+
+def generate_plain_english_findings(url: str, features: Dict[str, Any], risk_score: float) -> Tuple[List[str], List[str]]:
+    good_findings: List[str] = []
+    red_flags: List[str] = []
+
+    if features.get("is_https", 0) == 1:
+        good_findings.append("Uses a standard secure connection (HTTPS)")
+    else:
+        red_flags.append("Not using a secure connection (HTTP instead of HTTPS)")
+
+    if features.get("has_ip_address", 0) == 1:
+        red_flags.append("Uses an IP number (like 192.168.1.1) instead of a real website name")
+    else:
+        good_findings.append("Belongs to a recognized website name format")
+
+    if features.get("is_shortened", 0) == 1:
+        red_flags.append("Uses a shortened link (like bit.ly) which hides where it really goes")
+    else:
+        good_findings.append("Direct address (not a hidden short link)")
+
+    kw_count = features.get("keyword_count", 0)
+    if kw_count > 0:
+        red_flags.append("Contains urgent login, banking, or account words often found in scam messages")
+    else:
+        good_findings.append("No urgent banking or login keywords detected")
+
+    if features.get("count_at", 0) > 0:
+        red_flags.append("Has an '@' symbol, which scam links use to fool your browser into visiting a different site")
+    else:
+        good_findings.append("No tricky '@' characters used to disguise the real site")
+
+    if features.get("has_double_slash_path", 0) == 1:
+        red_flags.append("Contains double slashes ('//') inside the address, often used for sneaky redirects")
+
+    if features.get("subdomain_depth", 0) >= 2:
+        red_flags.append("Has multiple confusing extra domain names, often used to imitate real brands (e.g. paypal.fake-site.com)")
+    else:
+        good_findings.append("Standard website name without confusing extra parts")
+
+    if features.get("count_hyphens", 0) >= 3:
+        red_flags.append("Contains an unusual number of hyphens, often used to create look-alike scam domains")
+
+    if features.get("url_length", 0) > 75:
+        red_flags.append("Unusually long web link (scammers make links long to hide fake names on phone screens)")
+
+    return good_findings, red_flags
+
+
+# ==============================================================================
+# SECTION 3: HUMAN-FRIENDLY STREAMLIT APPLICATION
+# ==============================================================================
+
+st.set_page_config(page_title="Link Safety Checker — Check Before You Click", page_icon="🛡️", layout="wide")
+
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap');
+
+    html, body, [data-testid="stAppViewContainer"] {
+        background-color: #121826 !important;
+        color: #F1F5F9 !important;
+        font-family: 'Plus Jakarta Sans', sans-serif !important;
+    }
+    [data-testid="stSidebar"] {
+        background-color: #0F172A !important;
+        border-right: 1px solid rgba(255, 255, 255, 0.08) !important;
+    }
+    .app-card {
+        background: #1E293B;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 16px;
+        padding: 24px;
+        margin-bottom: 20px;
+    }
+    .verdict-box-safe {
+        background: linear-gradient(135deg, rgba(16, 185, 129, 0.12) 0%, #1E293B 100%);
+        border: 1px solid rgba(16, 185, 129, 0.4);
+        border-left: 6px solid #10B981;
+    }
+    .verdict-box-caution {
+        background: linear-gradient(135deg, rgba(245, 158, 11, 0.12) 0%, #1E293B 100%);
+        border: 1px solid rgba(245, 158, 11, 0.4);
+        border-left: 6px solid #F59E0B;
+    }
+    .verdict-box-danger {
+        background: linear-gradient(135deg, rgba(239, 68, 68, 0.14) 0%, #1E293B 100%);
+        border: 1px solid rgba(239, 68, 68, 0.45);
+        border-left: 6px solid #EF4444;
+    }
+    .verdict-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 16px;
+        border-radius: 20px;
+        font-size: 0.95rem;
+        font-weight: 700;
+        margin-bottom: 12px;
+    }
+    .badge-safe { background: rgba(16, 185, 129, 0.18); color: #34D399; border: 1px solid rgba(16, 185, 129, 0.4); }
+    .badge-caution { background: rgba(245, 158, 11, 0.18); color: #FBBF24; border: 1px solid rgba(245, 158, 11, 0.4); }
+    .badge-danger { background: rgba(239, 68, 68, 0.2); color: #F87171; border: 1px solid rgba(239, 68, 68, 0.45); }
+    .verdict-title { font-size: 1.45rem; font-weight: 700; margin-bottom: 8px; }
+    .advice-callout {
+        background: rgba(0, 0, 0, 0.25);
+        border-radius: 10px;
+        padding: 14px 18px;
+        font-size: 0.96rem;
+        line-height: 1.55;
+        margin-top: 14px;
+        color: #E2E8F0;
+        border-left: 3px solid rgba(255, 255, 255, 0.2);
+    }
+    .inspector-pill {
+        background: #0F172A;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 12px;
+        padding: 16px;
+        height: 100%;
+    }
+    .inspector-label { font-size: 0.76rem; font-weight: 700; text-transform: uppercase; color: #94A3B8; margin-bottom: 6px; }
+    .inspector-val { font-size: 1.05rem; font-weight: 600; color: #F8FAFC; word-break: break-all; font-family: 'JetBrains Mono', monospace; }
+    .inspector-sub { font-size: 0.82rem; color: #94A3B8; margin-top: 6px; }
+    .finding-item { display: flex; align-items: flex-start; gap: 10px; padding: 10px 14px; border-radius: 10px; font-size: 0.92rem; margin-bottom: 8px; }
+    .finding-safe { background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); color: #D1FAE5; }
+    .finding-danger { background: rgba(239, 68, 68, 0.09); border: 1px solid rgba(239, 68, 68, 0.25); color: #FEE2E2; }
+    div[data-testid="stTextInput"] input {
+        background-color: #0F172A !important; color: #F8FAFC !important;
+        border: 1px solid rgba(255, 255, 255, 0.15) !important; border-radius: 12px !important;
+        font-size: 1rem !important; padding: 14px 18px !important;
+    }
+    div[data-testid="stButton"] > button {
+        border-radius: 10px !important; font-weight: 600 !important;
+        border: 1px solid rgba(255, 255, 255, 0.12) !important; background: #1E293B !important; color: #F8FAFC !important;
+    }
+    div[data-testid="stButton"] > button:hover { border-color: #38BDF8 !important; background: #334155 !important; }
+    div[data-testid="stButton"] > button[kind="primary"] { background: #2563EB !important; border: none !important; color: #FFFFFF !important; font-weight: 700 !important; }
+</style>
+""", unsafe_allow_html=True)
+
+
+@st.cache_resource(show_spinner="Checking security model...")
+def init_detector():
+    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.pkl")
+    m, metrics = load_or_train_model(model_path)
+    ext = URLLexicalExtractor()
+    return m, ext, metrics
+
+
+model, extractor, _ = init_detector()
+
+with st.sidebar:
+    st.markdown("""
+    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 12px; padding: 4px 0;">
+        <span style="font-size: 1.8rem;">🛡️</span>
+        <div>
+            <div style="font-size: 1.15rem; font-weight: 700; color: #F8FAFC;">Link Safety Checker</div>
+            <div style="font-size: 0.8rem; color: #94A3B8;">Check before you click</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    page = st.radio("Menu", ["🔗 Check a Link", "📁 Check a File of Links (Batch)", "💡 Safety Tips"], index=0)
+    st.markdown("---")
+    st.markdown("""
+    <div style="font-size: 0.85rem; color: #94A3B8; line-height: 1.6; background: #1E293B; padding: 14px; border-radius: 12px;">
+        <b style="color: #F8FAFC;">🔒 Your Privacy First:</b><br>
+        Links are checked entirely in memory. We never share, sell, or log the links you enter.
+    </div>
+    """, unsafe_allow_html=True)
+
+if page == "🔗 Check a Link":
+    st.markdown("""
+    <div style="margin-bottom: 24px;">
+        <h1 style="font-size: 2.2rem; font-weight: 800; color: #F8FAFC; margin-bottom: 8px;">Link Safety Checker</h1>
+        <p style="font-size: 1.08rem; color: #94A3B8; margin: 0; line-height: 1.5;">Check any link before you click. Paste an unfamiliar email link, SMS text, or social media message to see if it's safe.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if "user_link" not in st.session_state:
+        st.session_state["user_link"] = "https://en.wikipedia.org/wiki/Computer_security"
+    if "check_active" not in st.session_state:
+        st.session_state["check_active"] = True
+
+    def set_sample(url_to_set: str):
+        st.session_state["user_link"] = url_to_set
+        st.session_state["check_active"] = True
+
+    st.markdown("##### 💡 Try an Example:")
+    t1, t2, t3, t4 = st.columns(4)
+    with t1:
+        st.button("🟢 Try Google", on_click=set_sample, args=("https://www.google.com/search?q=weather+today",), use_container_width=True)
+    with t2:
+        st.button("🟢 Try Short Link (o.com)", on_click=set_sample, args=("https://www.o.com/search?q=weather+today",), use_container_width=True)
+    with t3:
+        st.button("🔴 Try Typosquat (gogle.com)", on_click=set_sample, args=("https://gogle.com",), use_container_width=True)
+    with t4:
+        st.button("🔴 Try Fake PayPal Link", on_click=set_sample, args=("http://paypal-security-update.com.verify-auth.xyz/signin?account=locked",), use_container_width=True)
+
+    st.markdown("<div style='height: 8px;'></div>", unsafe_allow_html=True)
+    entered_url = st.text_input("Paste the link you want to check:", key="user_link", placeholder="e.g., netflix-billing-update.com or https://google.com")
+
+    btn_col, _ = st.columns([1.2, 4])
+    with btn_col:
+        check_clicked = st.button("🔍 Check This Link", type="primary", use_container_width=True)
+
+    if check_clicked:
+        st.session_state["check_active"] = True
+
+    if st.session_state.get("check_active", False) and entered_url.strip():
+        clean_url = clean_input_link(entered_url)
+        url_parts = parse_link_parts(clean_url)
+        result = predict_url(clean_url, model=model, extractor=extractor)
+        risk_score = result["risk_score"]
+        status_label = result["status"]
+        features = result["features"]
+        good_findings, red_flags = generate_plain_english_findings(clean_url, features, risk_score)
+
+        # Check for Brand Typosquatting / Impersonation
+        is_typosquat, spoofed_brand, sim_score = check_brand_typosquatting(url_parts["host"])
+        if is_typosquat:
+            risk_score = max(risk_score, 78.5)
+            status_label = "Phishing"
+            red_flags.insert(0, f"⚠️ Possible Typosquatting / Brand Impersonation of {spoofed_brand}")
+            good_findings = [f for f in good_findings if "recognized website name format" not in f]
+
+        st.markdown("<div style='height: 18px;'></div>", unsafe_allow_html=True)
+
+        if is_typosquat:
+            verdict_box_class = "verdict-box-danger"
+            badge_class = "badge-danger"
+            badge_text = "🔴 High Risk / Brand Impersonation"
+            verdict_text = f"Warning: This link appears to imitate {spoofed_brand}!"
+            advice_text = f"⛔ <b>Advice:</b> This address looks deceivingly similar to the authentic brand <b>{spoofed_brand}</b>. Do NOT click, do not enter passwords, and do not type sensitive info."
+            score_color = "#EF4444"
+        elif risk_score >= 65.0 or status_label == "Phishing":
+            verdict_box_class = "verdict-box-danger"
+            badge_class = "badge-danger"
+            badge_text = "🔴 High Risk / Dangerous Phishing"
+            verdict_text = "Warning: High risk of phishing or credential theft!"
+            advice_text = "⛔ <b>Advice:</b> Do NOT click this link, do not enter any passwords or codes, and do not download anything from it."
+            score_color = "#EF4444"
+        elif risk_score >= 35.0 or status_label == "Suspicious":
+            verdict_box_class = "verdict-box-caution"
+            badge_class = "badge-caution"
+            badge_text = "🟡 Proceed with Caution"
+            verdict_text = "Exercise caution. This link contains odd patterns like redirect shorteners or multiple hyphens."
+            advice_text = "⚠️ <b>Advice:</b> If this link came from an unexpected text message or email, do not enter personal or billing info."
+            score_color = "#F59E0B"
+        else:
+            verdict_box_class = "verdict-box-safe"
+            badge_class = "badge-safe"
+            badge_text = "🟢 Safe to Browse"
+            verdict_text = "Looks good! This link uses standard official domain practices and secure HTTPS."
+            advice_text = "💡 <b>Advice:</b> Safe to open, but always verify you are on the right official website before typing your password."
+            score_color = "#10B981"
+
+        st.markdown(f"""
+        <div class="app-card {verdict_box_class}">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
+                <span class="verdict-badge {badge_class}">{badge_text}</span>
+                <span style="font-family: 'JetBrains Mono', monospace; font-size: 1.1rem; font-weight: 700; color: {score_color};">
+                    {risk_score}% Risk Level
+                </span>
+            </div>
+            <div class="verdict-title">{verdict_text}</div>
+            <div class="advice-callout">{advice_text}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown("#### 🔍 Where does this link actually go?")
+        st.caption("Here is where your browser will actually connect if you click:")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(f"""
+            <div class="inspector-pill">
+                <div class="inspector-label">[1] Real Website Name</div>
+                <div class="inspector-val">{url_parts['host']}</div>
+                <div class="inspector-sub">This is the actual company or server hosting the site.</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col2:
+            sec_title = "🔒 Secure (HTTPS)" if url_parts['is_https'] else "⚠️ Not Secure (HTTP)"
+            sec_color = "#34D399" if url_parts['is_https'] else "#F87171"
+            st.markdown(f"""
+            <div class="inspector-pill">
+                <div class="inspector-label">[2] Security Connection</div>
+                <div class="inspector-val" style="color: {sec_color};">{sec_title}</div>
+                <div class="inspector-sub">{'Your connection is encrypted.' if url_parts['is_https'] else 'Data sent to this link is unencrypted.'}</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col3:
+            path_display = url_parts['path'] if len(url_parts['path']) < 38 else f"{url_parts['path'][:35]}..."
+            st.markdown(f"""
+            <div class="inspector-pill">
+                <div class="inspector-label">[3] Target Page</div>
+                <div class="inspector-val">{path_display}</div>
+                <div class="inspector-sub">The specific folder or page the link opens.</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height: 18px;'></div>", unsafe_allow_html=True)
+        st.markdown("#### 📋 What We Found in this Link")
+        g_col, r_col = st.columns(2)
+        with g_col:
+            st.markdown('<div class="app-card" style="border-top: 3px solid #10B981; height: 100%;"><h4 style="color: #34D399; margin-top: 0; margin-bottom: 14px;">✅ Things that look good</h4>', unsafe_allow_html=True)
+            if good_findings:
+                for item in good_findings:
+                    st.markdown(f'<div class="finding-item finding-safe">✓ {item}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="finding-item" style="background: rgba(255,255,255,0.03); color: #94A3B8;">No reassuring safety markers found.</div>', unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with r_col:
+            st.markdown('<div class="app-card" style="border-top: 3px solid #EF4444; height: 100%;"><h4 style="color: #F87171; margin-top: 0; margin-bottom: 14px;">⚠️ Red flags to be aware of</h4>', unsafe_allow_html=True)
+            if red_flags:
+                for item in red_flags:
+                    st.markdown(f'<div class="finding-item finding-danger">✗ {item}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="finding-item finding-safe">✓ No common scam red flags found in this address!</div>', unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
+elif page == "📁 Check a File of Links (Batch)":
+    st.markdown("""
+    <div style="margin-bottom: 24px;">
+        <h1 style="font-size: 2.2rem; font-weight: 800; color: #F8FAFC; margin-bottom: 8px;">Check Multiple Links at Once</h1>
+        <p style="font-size: 1.05rem; color: #94A3B8; margin: 0;">Have a spreadsheet or document with several links? Upload it here to check them all together.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    uploaded_file = st.file_uploader("Choose file (.csv or .txt):", type=["csv", "txt"])
+    if uploaded_file is not None:
+        links_list = []
+        try:
+            if uploaded_file.name.endswith(".csv"):
+                df_in = pd.read_csv(uploaded_file)
+                found_col = None
+                for col in df_in.columns:
+                    if str(col).strip().lower() in ["url", "urls", "link", "links", "website", "address"]:
+                        found_col = col
+                        break
+                if found_col is None:
+                    found_col = df_in.columns[0]
+                links_list = df_in[found_col].dropna().astype(str).str.strip().tolist()
+            else:
+                raw_text = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+                links_list = [line.strip() for line in raw_text.splitlines() if line.strip() and not line.startswith("#")]
+        except Exception as e:
+            st.error(f"Could not read file: {e}")
+
+        if links_list:
+            st.info(f"Found **{len(links_list)}** links ready to check.")
+            if st.button("🚀 Check All Links", type="primary"):
+                pbar = st.progress(0)
+                rows = []
+                for idx, raw_l in enumerate(links_list):
+                    cleaned_l = clean_input_link(raw_l)
+                    parts_l = parse_link_parts(cleaned_l)
+                    res = predict_url(cleaned_l, model=model, extractor=extractor)
+
+                    score = res["risk_score"]
+                    is_typo_b, spoof_b, sim_b = check_brand_typosquatting(parts_l["host"])
+                    if is_typo_b:
+                        score = max(score, 78.5)
+                        verdict = "🔴 High Risk"
+                        key_finding = f"⚠️ Possible Typosquatting / Brand Impersonation of {spoof_b}"
+                    elif score >= 65.0 or res["status"] == "Phishing":
+                        verdict = "🔴 High Risk"
+                        good_f, red_f = generate_plain_english_findings(cleaned_l, res["features"], score)
+                        key_finding = red_f[0] if red_f else "Phishing risk indicators detected"
+                    elif score >= 35.0 or res["status"] == "Suspicious":
+                        verdict = "🟡 Caution"
+                        good_f, red_f = generate_plain_english_findings(cleaned_l, res["features"], score)
+                        key_finding = red_f[0] if red_f else "Unusual link structure"
+                    else:
+                        verdict = "🟢 Safe"
+                        key_finding = "Passed all standard safety checks"
+
+                    rows.append({
+                        "Link": raw_l,
+                        "Verdict": verdict,
+                        "Risk Level": f"{score}%",
+                        "Key Findings": key_finding,
+                        "Secure Connection": "Yes (HTTPS)" if res["features"]["is_https"] else "No (HTTP)",
+                    })
+                    pbar.progress((idx + 1) / len(links_list))
+
+                batch_df = pd.DataFrame(rows)
+                st.dataframe(batch_df, use_container_width=True)
+                csv_output = batch_df.to_csv(index=False).encode("utf-8")
+                st.download_button("📥 Download Results as CSV", data=csv_output, file_name="link_safety_results.csv", mime="text/csv", type="primary")
+
+elif page == "💡 Safety Tips":
+    st.markdown("""
+    <div style="margin-bottom: 24px;">
+        <h1 style="font-size: 2.2rem; font-weight: 800; color: #F8FAFC; margin-bottom: 8px;">Simple Tips to Stay Safe Online</h1>
+        <p style="font-size: 1.05rem; color: #94A3B8; margin: 0;">Most scam links rely on tricking human psychology. Here is how you can spot and avoid them easily.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    tip_c1, tip_c2 = st.columns(2)
+    with tip_c1:
+        st.markdown("""
+        <div class="app-card">
+            <h3 style="color: #38BDF8; margin-top: 0;">1. Look closely at the website name</h3>
+            <p style="color: #CBD5E1; line-height: 1.6;">Scammers often buy look-alike names. The real website is always the <b>very last word before the slash</b>. In <code>netflix.com.verify-account.xyz/</code>, the real owner is <code>verify-account.xyz</code>, not Netflix!</p>
+        </div>
+        <div class="app-card">
+            <h3 style="color: #38BDF8; margin-top: 0;">2. Beware of false urgency</h3>
+            <p style="color: #CBD5E1; line-height: 1.6;">Almost all phishing scams try to rush you into making a mistake ("Your account is locked within 24 hours!"). Take a breath—real banks rarely give a 1-hour ultimatum.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    with tip_c2:
+        st.markdown("""
+        <div class="app-card">
+            <h3 style="color: #38BDF8; margin-top: 0;">3. Watch out for raw numbers in links</h3>
+            <p style="color: #CBD5E1; line-height: 1.6;">If a link starts with numbers like <code>http://192.168.1.1/</code>, do not open it. Real companies use proper registered domain names, not bare numbers.</p>
+        </div>
+        <div class="app-card">
+            <h3 style="color: #38BDF8; margin-top: 0;">4. When in doubt, go directly</h3>
+            <p style="color: #34D399; font-weight: 600; line-height: 1.6; background: rgba(16, 185, 129, 0.1); padding: 12px; border-radius: 8px;">Never click a login link sent in an unexpected email or SMS. Open your browser yourself and go to the official website directly.</p>
+        </div>
+        """, unsafe_allow_html=True)
